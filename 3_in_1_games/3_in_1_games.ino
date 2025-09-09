@@ -1,0 +1,554 @@
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <EEPROM.h>
+
+#ifdef U8X8_HAVE_HW_SPI
+#include <SPI.h>
+#endif
+#ifdef U8X8_HAVE_HW_I2C
+#include <Wire.h>
+#endif
+
+#define SDA_PIN 5
+#define SCL_PIN 6
+#define BUTTON_PIN 0
+#define LED_PIN 8
+
+U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R2, /* reset=*/U8X8_PIN_NONE);
+
+// Состояния игры
+enum GameState { MENU, FLAPPY, DINO, SPACE_INVADERS };
+GameState currentGame = MENU;
+int menuSelection = 0; // 0 - Flappy, 1 - Dino, 2 - Space Invaders
+
+// Для обработки кнопки
+unsigned long buttonPressTime = 0;
+bool buttonPressed = false;
+const int LONG_PRESS_THRESHOLD = 1000; // мс для "длинного нажатия"
+const int DEBOUNCE_DELAY = 50;
+
+// === FLAPPY BIRD ===
+int birdY = 20;
+int birdVelocity = 0;
+int gravity = 1;
+int flapPower = -4;
+
+struct Pipe {
+  int x;
+  int gapY;
+  int gapHeight = 16;
+  bool passed = false;
+};
+
+Pipe pipes[3];
+int pipeSpeed = 2;
+int pipeSpacing = 30;
+int nextPipeX = 72;
+
+int flappyScore = 0;
+int flappyBestScore = 0;
+bool flappyGameOver = false;
+
+#define EEPROM_ADDR_FLAPPY 0
+#define EEPROM_ADDR_DINO   1
+#define EEPROM_ADDR_SPACE  2
+
+// === DINO T-REX ===
+int dinoY = 28;
+bool isJumping = false;
+int jumpVelocity = 0;
+int jumpGravity = 1;
+int jumpPower = -6;
+
+struct Cactus {
+  int x;
+  int width;
+  int height;
+  bool passed = false;
+};
+
+const int GROUND_Y = 28;
+const int MAX_CACTUSES = 3;
+Cactus cactuses[MAX_CACTUSES];
+int cactusSpeed = 2;
+int nextCactusDistance = 40;
+int lastCactusX = 72 + nextCactusDistance;
+
+int dinoScore = 0;
+int dinoBestScore = 0;
+bool dinoGameOver = false;
+
+// === SPACE INVADERS ===
+int playerX = 34;           // Начальная позиция корабля (по центру)
+int playerDirection = 1;    // 1 = вправо, -1 = влево
+int playerSpeed = 2;
+
+struct Bullet {
+  int x, y;
+  bool active = false;
+};
+
+Bullet bullet;
+
+struct Invader {
+  int x, y;
+  bool alive = true;
+  int moveDelay = 0;
+  int moveStep = 0;
+};
+
+const int MAX_INVADERS = 3;
+Invader invaders[MAX_INVADERS];
+
+int spaceScore = 0;
+int spaceBestScore = 0;
+bool spaceGameOver = false;
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_5x7_tr);
+
+  EEPROM.begin(64);
+  
+  flappyBestScore = EEPROM.read(EEPROM_ADDR_FLAPPY);
+  if (flappyBestScore > 100) flappyBestScore = 0;
+
+  dinoBestScore = EEPROM.read(EEPROM_ADDR_DINO);
+  if (dinoBestScore > 100) dinoBestScore = 0;
+
+  spaceBestScore = EEPROM.read(EEPROM_ADDR_SPACE);
+  if (spaceBestScore > 100) spaceBestScore = 0;
+}
+
+void loop() {
+  handleButton();
+
+  unsigned long now = millis();
+  static unsigned long lastUpdate = 0;
+  const int frameDelay = 100;
+
+  if (now - lastUpdate < frameDelay) return;
+  lastUpdate = now;
+
+  switch (currentGame) {
+    case MENU:
+      drawMenu();
+      break;
+    case FLAPPY:
+      updateFlappy();
+      break;
+    case DINO:
+      updateDino();
+      break;
+    case SPACE_INVADERS:
+      updateSpaceInvaders();
+      break;
+  }
+}
+
+void handleButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (!buttonPressed) {
+      buttonPressTime = millis();
+      buttonPressed = true;
+    } else {
+      // Проверяем, не прошло ли уже LONG_PRESS во время УДЕРЖАНИЯ
+      if (buttonPressed && (millis() - buttonPressTime > LONG_PRESS_THRESHOLD)) {
+        // Длинное нажатие — обрабатываем СРАЗУ, не дожидаясь отпускания
+        if (currentGame == MENU) {
+          switch (menuSelection) {
+            case 0: currentGame = FLAPPY; resetFlappy(); break;
+            case 1: currentGame = DINO; resetDino(); break;
+            case 2: currentGame = SPACE_INVADERS; resetSpaceInvaders(); break;
+          }
+        } else if (currentGame == FLAPPY && flappyGameOver) {
+          resetFlappy();
+        } else if (currentGame == DINO && dinoGameOver) {
+          resetDino();
+        } else if (currentGame == SPACE_INVADERS && spaceGameOver) {
+          resetSpaceInvaders();
+        } else {
+          // Возврат в меню из любой активной игры
+          currentGame = MENU;
+        }
+        // Сбрасываем флаг, чтобы не срабатывало повторно
+        buttonPressed = false;
+      }
+    }
+  } else {
+    // Кнопка отпущена
+    if (buttonPressed) {
+      unsigned long pressDuration = millis() - buttonPressTime;
+      if (pressDuration < 200) {
+        // Короткое нажатие
+        if (currentGame == MENU) {
+          menuSelection = (menuSelection + 1) % 3;
+        } else if (currentGame == SPACE_INVADERS && !bullet.active) {
+          // Выстрел в Space Invaders
+          bullet.active = true;
+          bullet.x = playerX + 2;
+          bullet.y = 36;
+        }
+      }
+      // Сбрасываем состояние кнопки
+      buttonPressed = false;
+    }
+  }
+}
+
+// === FLAPPY BIRD ===
+void resetFlappy() {
+  birdY = 20;
+  birdVelocity = 0;
+  flappyScore = 0;
+  flappyGameOver = false;
+
+  for (int i = 0; i < 3; i++) {
+    pipes[i].x = nextPipeX + i * pipeSpacing;
+    pipes[i].gapY = random(5, 25);
+    pipes[i].passed = false;
+  }
+}
+
+void updateFlappy() {
+  if (flappyGameOver) {
+    if (flappyScore > flappyBestScore) {
+      flappyBestScore = flappyScore;
+      EEPROM.write(EEPROM_ADDR_FLAPPY, flappyBestScore);
+      EEPROM.commit();
+    }
+    drawFlappyGameOver();
+    return;
+  }
+
+  if (buttonPressed && millis() - buttonPressTime > DEBOUNCE_DELAY) {
+    birdVelocity = flapPower;
+  }
+
+  birdVelocity += gravity;
+  birdY += birdVelocity;
+
+  if (birdY < 0) birdY = 0;
+  if (birdY > 36) {
+    flappyGameOver = true;
+    triggerDeath();
+  }
+
+  for (int i = 0; i < 3; i++) {
+    pipes[i].x -= pipeSpeed;
+
+    if (pipes[i].x < 6 && pipes[i].x + 4 > 2) {
+      if (birdY < pipes[i].gapY || birdY + 4 > pipes[i].gapY + pipes[i].gapHeight) {
+        flappyGameOver = true;
+        triggerDeath();
+      }
+    }
+
+    if (!pipes[i].passed && pipes[i].x < 2) {
+      pipes[i].passed = true;
+      flappyScore++;
+    }
+
+    if (pipes[i].x < -6) {
+      pipes[i].x = nextPipeX;
+      pipes[i].gapY = random(5, 25);
+      pipes[i].passed = false;
+    }
+  }
+
+  drawFlappy();
+}
+
+void drawFlappy() {
+  u8g2.clearBuffer();
+  u8g2.drawBox(2, birdY, 4, 4);
+
+  for (int i = 0; i < 3; i++) {
+    u8g2.drawBox(pipes[i].x, 0, 4, pipes[i].gapY);
+    u8g2.drawBox(pipes[i].x, pipes[i].gapY + pipes[i].gapHeight, 4, 40 - (pipes[i].gapY + pipes[i].gapHeight));
+  }
+
+  u8g2.setCursor(0, 8);
+  u8g2.print("Score:");
+  u8g2.setCursor(40, 8);
+  u8g2.print(flappyScore);
+
+  u8g2.sendBuffer();
+}
+
+void drawFlappyGameOver() {
+  u8g2.clearBuffer();
+  u8g2.setCursor(5, 15);
+  u8g2.print("Game Over");
+  u8g2.setCursor(5, 25);
+  u8g2.print("Score:");
+  u8g2.setCursor(40, 25);
+  u8g2.print(flappyScore);
+  u8g2.setCursor(5, 35);
+  u8g2.print("Best:");
+  u8g2.setCursor(40, 35);
+  u8g2.print(flappyBestScore);
+  u8g2.sendBuffer();
+}
+
+// === DINO T-REX ===
+void resetDino() {
+  dinoY = GROUND_Y;
+  isJumping = false;
+  jumpVelocity = 0;
+  dinoScore = 0;
+  dinoGameOver = false;
+  lastCactusX = 72 + nextCactusDistance;
+
+  for (int i = 0; i < MAX_CACTUSES; i++) {
+    cactuses[i].x = lastCactusX + i * (nextCactusDistance + 10);
+    cactuses[i].width = 3;
+    cactuses[i].height = random(8, 14);
+    cactuses[i].passed = false;
+  }
+}
+
+void updateDino() {
+  if (dinoGameOver) {
+    if (dinoScore > dinoBestScore) {
+      dinoBestScore = dinoScore;
+      EEPROM.write(EEPROM_ADDR_DINO, dinoBestScore);
+      EEPROM.commit();
+    }
+    drawDinoGameOver();
+    return;
+  }
+
+  if (buttonPressed && millis() - buttonPressTime > DEBOUNCE_DELAY && !isJumping) {
+    isJumping = true;
+    jumpVelocity = jumpPower;
+  }
+
+  if (isJumping) {
+    dinoY += jumpVelocity;
+    jumpVelocity += jumpGravity;
+    if (dinoY >= GROUND_Y) {
+      dinoY = GROUND_Y;
+      isJumping = false;
+      jumpVelocity = 0;
+    }
+  }
+
+  for (int i = 0; i < MAX_CACTUSES; i++) {
+    cactuses[i].x -= cactusSpeed;
+
+    if (cactuses[i].x < 6 && cactuses[i].x + cactuses[i].width > 2) {
+      if (dinoY + 4 > GROUND_Y - cactuses[i].height) {
+        dinoGameOver = true;
+        triggerDeath();
+      }
+    }
+
+    if (!cactuses[i].passed && cactuses[i].x < 0) {
+      cactuses[i].passed = true;
+      dinoScore++;
+    }
+
+    if (cactuses[i].x < -cactuses[i].width) {
+      cactuses[i].x = lastCactusX + random(30, 60);
+      cactuses[i].width = random(2, 4);
+      cactuses[i].height = random(8, 14);
+      cactuses[i].passed = false;
+    }
+  }
+
+  drawDino();
+}
+
+void drawDinoSprite(int x, int y) {
+  
+  u8g2.drawHLine(x+1, y-2, 4); 
+  u8g2.drawHLine(x, y-3, 2); 
+  u8g2.drawHLine(x+3, y-3, 2); 
+  u8g2.drawHLine(x+5, y-5, 2); 
+
+  u8g2.drawLine(x+2, y, x+2, y-3); 
+  u8g2.drawLine(x+4, y, x+4, y-6); 
+}
+
+void drawDino() {
+  u8g2.clearBuffer();
+  u8g2.drawLine(0, GROUND_Y + 4, 72, GROUND_Y + 4);
+  drawDinoSprite(2, dinoY - 2); // смещение -2, чтобы "встать" на землю красиво
+
+  for (int i = 0; i < MAX_CACTUSES; i++) {
+    u8g2.drawBox(cactuses[i].x, GROUND_Y - cactuses[i].height, cactuses[i].width, cactuses[i].height);
+    u8g2.drawLine(cactuses[i].x, GROUND_Y - cactuses[i].height+(cactuses[i].height/2), cactuses[i].x-2, GROUND_Y - cactuses[i].height+(cactuses[i].height/2));
+    u8g2.drawLine(cactuses[i].x-2, GROUND_Y - cactuses[i].height+(cactuses[i].height/2), cactuses[i].x-2, GROUND_Y - cactuses[i].height+(cactuses[i].height/2)-3);
+
+    u8g2.drawLine(cactuses[i].x+cactuses[i].width, GROUND_Y - cactuses[i].height+(cactuses[i].height/3), cactuses[i].x+cactuses[i].width+2, GROUND_Y - cactuses[i].height+(cactuses[i].height/3));
+    u8g2.drawLine(cactuses[i].x+cactuses[i].width+2, GROUND_Y - cactuses[i].height+(cactuses[i].height/3), cactuses[i].x+cactuses[i].width+2, GROUND_Y - cactuses[i].height+(cactuses[i].height/3)-3);
+  }
+
+  u8g2.setCursor(0, 8);
+  u8g2.print("Score:");
+  u8g2.setCursor(40, 8);
+  u8g2.print(dinoScore);
+
+  u8g2.sendBuffer();
+}
+
+void drawDinoGameOver() {
+  u8g2.clearBuffer();
+  u8g2.setCursor(5, 15);
+  u8g2.print("Game Over");
+  u8g2.setCursor(5, 25);
+  u8g2.print("Score:");
+  u8g2.setCursor(40, 25);
+  u8g2.print(dinoScore);
+  u8g2.setCursor(5, 35);
+  u8g2.print("Best:");
+  u8g2.setCursor(40, 35);
+  u8g2.print(dinoBestScore);
+  u8g2.sendBuffer();
+}
+
+// === SPACE INVADERS ===
+void resetSpaceInvaders() {
+  playerX = 34;
+  playerDirection = 1;
+  bullet.active = false;
+
+  spaceScore = 0;
+  spaceGameOver = false;
+
+  for (int i = 0; i < MAX_INVADERS; i++) {
+    invaders[i].alive = true;
+    invaders[i].x = 10 + i * 20;
+    invaders[i].y = 5 + (i * 8); // Ступеньками вниз
+    invaders[i].moveDelay = 0;
+    invaders[i].moveStep = 0;
+  }
+}
+
+void updateSpaceInvaders() {
+  if (spaceGameOver) {
+    if (spaceScore > spaceBestScore) {
+      spaceBestScore = spaceScore;
+      EEPROM.write(EEPROM_ADDR_SPACE, spaceBestScore);
+      EEPROM.commit();
+    }
+    drawSpaceGameOver();
+    return;
+  }
+
+  // Движение игрока
+  playerX += playerDirection * playerSpeed;
+  if (playerX <= 0 || playerX >= 68) {
+    playerDirection *= -1;
+  }
+
+  // Движение пули
+  if (bullet.active) {
+    bullet.y -= 2;
+    if (bullet.y < 0) {
+      bullet.active = false;
+    }
+  }
+
+  // Движение пришельцев и проверка на Game Over
+  for (int i = 0; i < MAX_INVADERS; i++) {
+    if (!invaders[i].alive) continue;
+
+    invaders[i].moveDelay++;
+    if (invaders[i].moveDelay > 5) { // Замедляем движение
+      invaders[i].moveDelay = 0;
+      invaders[i].y += 1;
+      if (invaders[i].y > 34) { // Если пришелец дошёл до низа
+        spaceGameOver = true;
+        triggerDeath();
+        return;
+      }
+    }
+
+    // Проверка попадания пули
+    if (bullet.active &&
+        bullet.x >= invaders[i].x && bullet.x <= invaders[i].x + 4 &&
+        bullet.y >= invaders[i].y && bullet.y <= invaders[i].y + 4) {
+      invaders[i].alive = false;
+      bullet.active = false;
+      spaceScore++;
+    }
+  }
+
+  drawSpaceInvaders();
+}
+
+void drawSpaceInvaders() {
+  u8g2.clearBuffer();
+
+  // Игрок (корабль 4x4)
+  u8g2.drawBox(playerX, 36, 4, 4);
+
+  // Пуля
+  if (bullet.active) {
+    u8g2.drawPixel(bullet.x, bullet.y);
+  }
+
+  // Пришельцы
+  for (int i = 0; i < MAX_INVADERS; i++) {
+    if (invaders[i].alive) {
+      u8g2.drawBox(invaders[i].x, invaders[i].y, 4, 4);
+    }
+  }
+
+  // Счёт
+  u8g2.setCursor(0, 8);
+  u8g2.print("Score:");
+  u8g2.setCursor(40, 8);
+  u8g2.print(spaceScore);
+
+  u8g2.sendBuffer();
+}
+
+void drawSpaceGameOver() {
+  u8g2.clearBuffer();
+  u8g2.setCursor(5, 15);
+  u8g2.print("Game Over");
+  u8g2.setCursor(5, 25);
+  u8g2.print("Score:");
+  u8g2.setCursor(40, 25);
+  u8g2.print(spaceScore);
+  u8g2.setCursor(5, 35);
+  u8g2.print("Best:");
+  u8g2.setCursor(40, 35);
+  u8g2.print(spaceBestScore);
+  u8g2.sendBuffer();
+}
+
+// === МЕНЮ ===
+void drawMenu() {
+  u8g2.clearBuffer();
+  u8g2.setCursor(10, 10);
+  u8g2.print("SELECT GAME");
+
+  const char* games[] = {"Flappy", "Dino", "Space"};
+  for (int i = 0; i < 3; i++) {
+    u8g2.setCursor(5, 20 + i * 8);
+    if (i == menuSelection) {
+      u8g2.print("> ");
+    } else {
+      u8g2.print("  ");
+    }
+    u8g2.print(games[i]);
+  }
+
+  u8g2.sendBuffer();
+}
+
+// Общая функция "смерти" — мигаем LED
+void triggerDeath() {
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+}
